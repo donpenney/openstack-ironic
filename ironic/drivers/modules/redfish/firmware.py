@@ -870,11 +870,14 @@ class RedfishFirmware(base.FirmwareInterface):
                 'nic_fw_updated', False)
 
             # Special handling for servicing mode: If this is the last component
-            # and we're in servicing mode, skip the post-update reboot.
-            # Servicing cleanup will trigger its own reboot, and firmware
-            # caching during that reboot will validate resources before
-            # collecting firmware data (see node_cache_firmware_components).
-            if task.node.service_step and reboot_requested:
+            # and we're in servicing mode, skip the post-update reboot UNLESS
+            # the component is a NIC. For NIC firmware updates, the firmware
+            # is not applied until after a reboot, so we must complete the
+            # post-update reboot before caching firmware.
+            component = fw_upd.get('component', '')
+            component_type = self._get_component_type(component)
+
+            if task.node.service_step and reboot_requested and component_type != 'nic':
                 LOG.info('Last firmware component completed for node %(node)s '
                          'in servicing mode. Skipping post-update reboot - '
                          'servicing cleanup will handle reboot and firmware '
