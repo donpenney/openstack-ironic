@@ -178,13 +178,33 @@ class RedfishFirmware(base.FirmwareInterface):
                         {'node_uuid': task.node.uuid})
             return nic_list
 
+        # Check if this is an HPE system
+        # HPE NetworkAdapter identities are not persistent across reboots
+        # (e.g., "DE080000" one boot, "DE009000" next boot), so we use
+        # SerialNumber for stable component naming instead.
+        is_hpe = (system.manufacturer and
+                  'HPE' in system.manufacturer.upper())
+
         for net_adp in chassis.network_adapters.get_members():
             for net_adp_ctrl in net_adp.controllers:
                 fw_pkg_v = net_adp_ctrl.firmware_package_version
                 if not fw_pkg_v:
                     continue
+
+                # For HPE: Use SerialNumber for stable component naming
+                # For others (e.g., Dell): Use identity (already slot-based)
+                if is_hpe and net_adp.serial_number:
+                    component_id = net_adp.serial_number
+                    LOG.debug('Using SerialNumber for HPE NIC component on '
+                             'node %(node)s: %(serial)s (identity: %(identity)s)',
+                             {'node': task.node.uuid,
+                              'serial': component_id,
+                              'identity': net_adp.identity})
+                else:
+                    component_id = net_adp.identity
+
                 net_adp_fw = {'component': redfish_utils.NIC_COMPONENT_PREFIX
-                              + net_adp.identity, 'current_version': fw_pkg_v}
+                              + component_id, 'current_version': fw_pkg_v}
                 nic_list.append(net_adp_fw)
 
         return nic_list
