@@ -159,6 +159,14 @@ def continue_inspection(task, inventory, plugin_data):
                 task.process_event('fail')
 
     if node.provision_state != states.ENROLL:
+        # Cache firmware components while node is powered on with IPA running.
+        # This ensures we capture NIC firmware data from HPE systems which only
+        # return NIC information when the node is powered on. This also caches
+        # vendor, boot mode, and BIOS settings.
+        LOG.debug('Caching firmware components after inspection for node %s',
+                  node.uuid)
+        utils.node_update_cache(task)
+
         task.process_event('done')
         LOG.info('Successfully finished inspection of node %s', node.uuid)
     else:
