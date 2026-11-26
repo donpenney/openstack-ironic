@@ -13,6 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import hashlib
+
 from oslo_log import log
 import sushy
 import tenacity
@@ -269,7 +271,7 @@ def _get_vmedia(task, managers):
 
 
 def _insert_vmedia(task, managers, boot_url, boot_device,
-                   username=None, password=None):
+                   username=None, password=None, preserve_existing=False):
     """Insert bootable ISO image into virtual CD or DVD
 
     :param task: A task from TaskManager.
@@ -279,10 +281,13 @@ def _insert_vmedia(task, managers, boot_url, boot_device,
         `VIRTUAL_MEDIA_DVD` or `VIRTUAL_MEDIA_FLOPPY`
     :param username: Optional username for image access authentication.
     :param password: Optional password for image access authentication.
+    :param preserve_existing: Only use a free slot and preserve inserted media.
     :raises: InvalidParameterValue, if no suitable virtual CD or DVD is
         found on the node.
     """
     err_msgs = []
+    insertion_options = (
+        {'preserve_existing': True} if preserve_existing else {})
     system = redfish_utils.get_system(task.node)
     if _has_vmedia_via_systems(system):
         # A ServerSideError surviving the retries means this resource failed;
@@ -291,7 +296,8 @@ def _insert_vmedia(task, managers, boot_url, boot_device,
             inserted = _insert_vmedia_in_resource(task, system, boot_url,
                                                   boot_device, err_msgs,
                                                   username=username,
-                                                  password=password)
+                                                  password=password,
+                                                  **insertion_options)
         except sushy.exceptions.ServerSideError:
             inserted = False
         if inserted:
@@ -303,7 +309,8 @@ def _insert_vmedia(task, managers, boot_url, boot_device,
                 inserted = _insert_vmedia_in_resource(task, manager, boot_url,
                                                       boot_device, err_msgs,
                                                       username=username,
-                                                      password=password)
+                                                      password=password,
+                                                      **insertion_options)
             except sushy.exceptions.ServerSideError:
                 continue
             if inserted:
@@ -336,12 +343,80 @@ def _insert_vmedia(task, managers, boot_url, boot_device,
     raise exception.InvalidParameterValue(exc_msg)
 
 
+def _deployment_media(task, managers):
+    """Read all devices in the same discovery path used for insertion."""
+    system = redfish_utils.get_system(task.node)
+    resources = [system] if _has_vmedia_via_systems(system) else managers
+    devices = []
+    errors = []
+    for resource in resources:
+        members = _get_vmedia_resources(task, resource, errors)
+        if members is None:
+            raise exception.InstanceDeployFailure(
+                _('Cannot inspect deployment virtual media for node %s')
+                % task.node.uuid)
+        devices.extend(members)
+    if not devices:
+        raise exception.InstanceDeployFailure(
+            _('No virtual media devices found for node %s') % task.node.uuid)
+    return devices
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type(exception.TemporaryFailure),
+    stop=tenacity.stop_after_attempt(10), wait=tenacity.wait_fixed(3),
+    reraise=True)
+def _eject_deployment_media(task, managers, owned_urls):
+    """Release only recorded deployment media, preserving unrelated slots."""
+    devices = _deployment_media(task, managers)
+    # Validate the whole set before changing any device. Unknown state is not
+    # proof that a device is empty, including on first deployment/adoption.
+    for device in devices:
+        device.refresh(force=True)
+        if device.inserted is not False and not device.image:
+            raise exception.InstanceDeployFailure(
+                _('Cannot determine the identity of inserted virtual media '
+                  'on node %s') % task.node.uuid)
+        if (not owned_urls and device.inserted is not False
+                and device.image not in owned_urls):
+            raise exception.InstanceDeployFailure(
+                _('Unowned or unknown virtual media prevents deployment '
+                  'of node %s') % task.node.uuid)
+    for device in devices:
+        if device.inserted is not False and device.image in owned_urls:
+            device.eject_media()
+            device.refresh(force=True)
+            if device.inserted is not False:
+                raise exception.TemporaryFailure()
+
+
+@tenacity.retry(
+    retry=tenacity.retry_if_exception_type(exception.TemporaryFailure),
+    stop=tenacity.stop_after_attempt(10), wait=tenacity.wait_fixed(3),
+    reraise=True)
+def _wait_for_deployment_media(task, managers, expected_urls):
+    """Do not power on until both InsertMedia operations are observable."""
+    inserted = set()
+    for device in _deployment_media(task, managers):
+        device.refresh(force=True)
+        if device.inserted is True:
+            inserted.add(device.image)
+    if not expected_urls.issubset(inserted):
+        raise exception.TemporaryFailure()
+
+
+def _vmedia_is_occupied(device):
+    device.refresh(force=True)
+    return device.inserted is not False
+
+
 @tenacity.retry(retry=tenacity.retry_if_exception(_test_retry),
                 stop=tenacity.stop_after_attempt(3),
                 wait=tenacity.wait_fixed(3),
                 reraise=True)
 def _insert_vmedia_in_resource(task, resource, boot_url, boot_device,
-                               err_msgs, username=None, password=None):
+                               err_msgs, username=None, password=None,
+                               preserve_existing=False):
     """Insert virtual media from a given redfish resource (System/Manager)
 
     :param task: A task from TaskManager.
@@ -352,6 +427,7 @@ def _insert_vmedia_in_resource(task, resource, boot_url, boot_device,
     :param err_msgs: A list that will contain all errors found
     :param username: Optional username for image access authentication.
     :param password: Optional password for image access authentication.
+    :param preserve_existing: Only use a free slot and preserve inserted media.
     :raises: InvalidParameterValue, if no suitable virtual CD or DVD is
         found on the node.
     """
@@ -375,12 +451,13 @@ def _insert_vmedia_in_resource(task, resource, boot_url, boot_device,
     # boot with nothing mounted. Eject any media from every usable slot of
     # this device type and re-insert into the first slot; the retry below
     # (story 2008504) covers an eject still in progress edge case.
-    try:
-        _eject_vmedia_from_resource(task, resource, boot_device)
-    except sushy.exceptions.SushyError as exc:
-        # Best effort; the insert below surfaces/retries real errors.
-        LOG.debug("Failed to eject existing boot media for node %(node)s: "
-                  "%(exc)s", {'node': task.node.uuid, 'exc': exc})
+    if not preserve_existing:
+        try:
+            _eject_vmedia_from_resource(task, resource, boot_device)
+        except sushy.exceptions.SushyError as exc:
+            # Best effort; the insert below surfaces/retries real errors.
+            LOG.debug("Failed to eject existing boot media for node %(node)s: "
+                      "%(exc)s", {'node': task.node.uuid, 'exc': exc})
 
     for v_media in resource.virtual_media.get_members():
         # Skip virtual media if the ID is not in the acceptable set
@@ -411,6 +488,14 @@ def _insert_vmedia_in_resource(task, resource, boot_url, boot_device,
                            'available_device': sushy.VIRTUAL_MEDIA_DVD})
             else:
                 continue
+
+        # Multi-type devices may advertise both USB and CD capabilities.
+        # Configuration media must not replace an occupied boot device, and
+        # an unknown insertion state must not be treated as an empty slot.
+        if preserve_existing and _vmedia_is_occupied(v_media):
+            if v_media.inserted is True and v_media.image == boot_url:
+                return True
+            continue
 
         try:
             kwargs = dict(inserted=True, write_protected=True)
@@ -1139,12 +1224,29 @@ class RedfishVirtualMediaBoot(base.BootInterface):
         """
         node = task.node
 
+        boot_option = deploy_utils.get_boot_option(node)
+        concurrent = (boot_option == 'ramdisk'
+                      and bool(node.instance_info.get('configdrive')))
+        if concurrent and node.provision_state == states.ACTIVE:
+            # Adoption must not replace bytes or interrupt a running guest.
+            media = node.driver_internal_info.get('ramdisk_virtual_media', {})
+            source = node.instance_info.get('configdrive')
+            if (not media.get('boot') or not media.get('configdrive')
+                    or (isinstance(source, str) and '://' in source
+                        and media.get('configdrive_source') != source)):
+                raise exception.InstanceDeployFailure(
+                    _('Cannot adopt live configuration media without its '
+                      'deployment identity; stop the deployment first'))
+            managers = redfish_utils.get_system(node).managers
+            _wait_for_deployment_media(
+                task, managers, {media['boot'], media['configdrive']})
+            return
+
         self._eject_all(task)
 
         boot_mode_utils.sync_boot_mode(task)
         boot_mode_utils.configure_secure_boot_if_needed(task)
 
-        boot_option = deploy_utils.get_boot_option(node)
         iwdi = node.driver_internal_info.get('is_whole_disk_image')
         if boot_option == "local" or iwdi:
             self._apply_boot_device(
@@ -1186,18 +1288,29 @@ class RedfishVirtualMediaBoot(base.BootInterface):
         deploy_info = _parse_deploy_info(node)
         iso_ref = image_utils.prepare_boot_iso(task, deploy_info, **params)
 
+        if concurrent:
+            node.set_driver_internal_info('ramdisk_virtual_media',
+                                          {'boot': iso_ref})
+            node.save()
+
         username = None
         password = None
         if selected_protocol.upper() in ('CIFS', 'SMB'):
             cifs_pub = image_publisher.CIFSPublisher()
             username, password = cifs_pub.get_credentials()
 
-        _eject_vmedia(task, managers, sushy.VIRTUAL_MEDIA_CD)
+        if not concurrent:
+            _eject_vmedia(task, managers, sushy.VIRTUAL_MEDIA_CD)
         _insert_vmedia(task, managers, iso_ref, sushy.VIRTUAL_MEDIA_CD,
-                       username=username, password=password)
+                       username=username, password=password,
+                       **({'preserve_existing': True} if concurrent else {}))
 
         if boot_option == 'ramdisk':
             self._attach_configdrive(task, managers)
+        if concurrent:
+            media = node.driver_internal_info['ramdisk_virtual_media']
+            _wait_for_deployment_media(
+                task, managers, {media['boot'], media['configdrive']})
 
         del managers
 
@@ -1217,18 +1330,48 @@ class RedfishVirtualMediaBoot(base.BootInterface):
                 _('Cannot attach a configdrive to node %s, as it is not '
                   'supported in the driver.') % task.node.uuid)
 
-        _eject_vmedia(task, managers, sushy.VIRTUAL_MEDIA_USBSTICK)
         cd_ref = image_utils.prepare_configdrive_image(task, configdrive)
+        # Persist the source/publication association before asking the BMC to
+        # insert. It survives an interrupted InsertMedia response and is also
+        # the identity used by BMO's DataImage observation.
+        media = task.node.driver_internal_info.get(
+            'ramdisk_virtual_media', {}).copy()
+        media['configdrive'] = cd_ref
+        # Configdrive URLs remain redacted in API responses. Observers can
+        # compare these fingerprints without access to driver secrets.
+        media['configuration_media_sha256'] = hashlib.sha256(
+            cd_ref.encode('utf-8')).hexdigest()
+        source = task.node.instance_info.get('configdrive')
+        if isinstance(source, str) and '://' in source:
+            media['configdrive_source'] = source
+            media['configuration_source_sha256'] = hashlib.sha256(
+                source.encode('utf-8')).hexdigest()
+        task.node.set_driver_internal_info('ramdisk_virtual_media', media)
+        task.node.save()
         try:
             _insert_vmedia(task, managers, cd_ref,
-                           sushy.VIRTUAL_MEDIA_USBSTICK)
-        except exception.InvalidParameterValue:
+                           sushy.VIRTUAL_MEDIA_USBSTICK,
+                           preserve_existing=True)
+        except exception.InvalidParameterValue as exc:
             raise exception.InstanceDeployFailure(
-                _('Cannot attach configdrive for node %s: no suitable '
-                  'virtual USB slot has been found') % task.node.uuid)
+                _('Cannot attach configuration drive for node %(node)s: '
+                  '%(error)s') % {'node': task.node.uuid, 'error': exc})
 
     def _eject_all(self, task):
         managers = redfish_utils.get_system(task.node).managers
+
+        media = task.node.driver_internal_info.get('ramdisk_virtual_media')
+        concurrent = (deploy_utils.get_boot_option(task.node) == 'ramdisk'
+                      and bool(task.node.instance_info.get('configdrive')))
+        if media is not None or concurrent:
+            owned = {media[key] for key in ('boot', 'configdrive')
+                     if media and media.get(key)}
+            _eject_deployment_media(task, managers, owned)
+            image_utils.cleanup_disk_image(task, prefix='configdrive')
+            image_utils.cleanup_iso_image(task)
+            task.node.del_driver_internal_info('ramdisk_virtual_media')
+            task.node.save()
+            return
 
         _eject_vmedia(task, managers, sushy.VIRTUAL_MEDIA_CD)
         config_via_removable = (

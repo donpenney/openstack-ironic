@@ -273,13 +273,18 @@ def prepare_configdrive_image(task, content):
                 images.fetch_into(task.context, content, tmpfile2)
                 tmpfile2.flush()
 
-                if utils.file_mime_type(tmpfile2.name) == "text/plain":
+                mime_type = utils.file_mime_type(tmpfile2.name)
+                if mime_type == "text/plain":
                     tmpfile2.seek(0)
                     base64.decode(tmpfile2, comp_tmpfile_obj)
                 else:
-                    # A binary image, use it as it is.
+                    # BMCs may treat an extensionless URL as a folder.
+                    # Preserve an ISO suffix when publishing an ISO payload.
+                    suffix = ('.iso' if mime_type
+                              == 'application/x-iso9660-image' else '')
                     return prepare_disk_image(task, tmpfile2.name,
-                                              prefix='configdrive')
+                                              prefix='configdrive',
+                                              suffix=suffix)
         else:
             comp_tmpfile_obj.write(base64.b64decode(content))
         comp_tmpfile_obj.seek(0)
@@ -293,7 +298,7 @@ def prepare_configdrive_image(task, content):
                                       prefix='configdrive')
 
 
-def prepare_disk_image(task, content, prefix=None):
+def prepare_disk_image(task, content, prefix=None, suffix=''):
     """Prepare an image with the given content.
 
     If content is already an HTTP URL, return it unchanged.
@@ -302,11 +307,12 @@ def prepare_disk_image(task, content, prefix=None):
     :param content: Content as a string with a file name or bytes with
         contents.
     :param prefix: Prefix to use for the object name.
+    :param suffix: Suffix to use for the object name.
     :raises: ImageCreationFailed, if it failed while creating the image.
     :raises: SwiftOperationError, if any operation with Swift fails.
     :returns: image URL for the image.
     """
-    object_name = _get_name(task.node, prefix=prefix)
+    object_name = _get_name(task.node, prefix=prefix, suffix=suffix)
 
     LOG.debug("Creating a disk image for node %s", task.node.uuid)
 
@@ -339,6 +345,10 @@ def cleanup_disk_image(task, prefix=None):
     :param prefix: Prefix to use for the object name.
     """
     ImageHandler.unpublish_image_for_node(task.node, prefix=prefix)
+    if prefix == 'configdrive':
+        # Only configdrives acquired an additional publication name.
+        ImageHandler.unpublish_image_for_node(
+            task.node, prefix=prefix, suffix='.iso')
 
 
 # FIXME(dtantsur): file_name is not node-specific, we should probably replace

@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import hashlib
 from unittest import mock
 
 import sushy
@@ -1193,24 +1194,25 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
             mock_prepare_boot_iso.return_value = 'image-url'
             mock_prepare_disk.return_value = 'cd-url'
 
-            task.driver.boot.prepare_instance(task)
+            with mock.patch.object(
+                    redfish_boot, '_wait_for_deployment_media', autospec=True):
+                task.driver.boot.prepare_instance(task)
 
             mock_clean_up_instance.assert_called_once_with(mock.ANY, task)
 
             mock_prepare_boot_iso.assert_called_once_with(task, d_info)
             mock_prepare_disk.assert_called_once_with(task, configdrive)
 
-            mock__eject_vmedia.assert_has_calls([
-                mock.call(task, managers, sushy.VIRTUAL_MEDIA_CD),
-                mock.call(task, managers, sushy.VIRTUAL_MEDIA_USBSTICK),
-            ])
+            mock__eject_vmedia.assert_not_called()
 
             mock__insert_vmedia.assert_has_calls([
                 mock.call(task, managers,
                           'image-url', sushy.VIRTUAL_MEDIA_CD,
-                          username=None, password=None),
+                          username=None, password=None,
+                          preserve_existing=True),
                 mock.call(task, managers,
-                          'cd-url', sushy.VIRTUAL_MEDIA_USBSTICK),
+                          'cd-url', sushy.VIRTUAL_MEDIA_USBSTICK,
+                          preserve_existing=True),
             ])
 
             mock_node_set_boot_device.assert_called_once_with(
@@ -1372,7 +1374,9 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
             mock_prepare_boot_iso.return_value = 'image-url'
             mock_prepare_disk.return_value = 'cd-url'
 
-            task.driver.boot.prepare_instance(task)
+            with mock.patch.object(
+                    redfish_boot, '_wait_for_deployment_media', autospec=True):
+                task.driver.boot.prepare_instance(task)
 
             mock_clean_up_instance.assert_called_once_with(mock.ANY, task)
 
@@ -1381,17 +1385,16 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
             mock_prepare_boot_iso.assert_called_once_with(task, d_info)
             mock_prepare_disk.assert_called_once_with(task, configdrive)
 
-            mock__eject_vmedia.assert_has_calls([
-                mock.call(task, managers, sushy.VIRTUAL_MEDIA_CD),
-                mock.call(task, managers, sushy.VIRTUAL_MEDIA_USBSTICK),
-            ])
+            mock__eject_vmedia.assert_not_called()
 
             mock__insert_vmedia.assert_has_calls([
                 mock.call(task, managers,
                           'image-url', sushy.VIRTUAL_MEDIA_CD,
-                          username=None, password=None),
+                          username=None, password=None,
+                          preserve_existing=True),
                 mock.call(task, managers,
-                          'cd-url', sushy.VIRTUAL_MEDIA_USBSTICK),
+                          'cd-url', sushy.VIRTUAL_MEDIA_USBSTICK,
+                          preserve_existing=True),
             ])
 
             mock_node_set_boot_device.assert_called_once_with(
@@ -1496,16 +1499,15 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
+            task.node.instance_info['configdrive'] = None
             mock_get_boot_option.return_value = 'ramdisk'
 
             task.driver.boot.clean_up_instance(task)
 
             mock_cleanup_iso_image.assert_called_once_with(task)
-            mock_cleanup_disk_image.assert_called_once_with(
-                task, prefix='configdrive')
+            mock_cleanup_disk_image.assert_not_called()
             eject_calls = [
                 mock.call(task, managers, sushy.VIRTUAL_MEDIA_CD),
-                mock.call(task, managers, sushy.VIRTUAL_MEDIA_USBSTICK),
             ]
 
             mock__eject_vmedia.assert_has_calls(eject_calls)
@@ -1918,6 +1920,95 @@ class RedfishVirtualMediaBootTestCase(db_base.DbTestCase):
             self.assertEqual(1, mock_vmedia_cd.eject_media.call_count)
             mock_vmedia_cd.insert_media.assert_called_once_with(
                 'img-url', inserted=True, write_protected=True)
+
+    @mock.patch.object(redfish_boot, '_has_vmedia_via_systems', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_configuration_media_preserves_boot_slot(
+            self, mock_system, mock_vmedia_system):
+        for via_system in (False, True):
+            with self.subTest(via_system=via_system):
+                with task_manager.acquire(self.context, self.node.uuid,
+                                          shared=True) as task:
+                    mock_vmedia_system.return_value = via_system
+                    task.driver.boot._get_acceptable_media_id = mock.Mock(
+                        return_value=None)
+                    boot = mock.MagicMock(
+                        identity='boot', inserted=True, image='boot-url',
+                        media_types=[sushy.VIRTUAL_MEDIA_CD,
+                                     sushy.VIRTUAL_MEDIA_USBSTICK])
+                    free = mock.MagicMock(
+                        identity='free', inserted=False,
+                        media_types=[sushy.VIRTUAL_MEDIA_CD,
+                                     sushy.VIRTUAL_MEDIA_USBSTICK])
+                    resource = (mock_system.return_value if via_system
+                                else mock.MagicMock())
+                    resource.virtual_media.get_members.return_value = [
+                        boot, free]
+
+                    redfish_boot._insert_vmedia(
+                        task, [resource], 'config-url',
+                        sushy.VIRTUAL_MEDIA_USBSTICK,
+                        preserve_existing=True)
+
+                    boot.eject_media.assert_not_called()
+                    boot.insert_media.assert_not_called()
+                    free.eject_media.assert_not_called()
+                    free.insert_media.assert_called_once_with(
+                        'config-url', inserted=True, write_protected=True)
+
+    @mock.patch.object(redfish_boot, '_has_vmedia_via_systems', autospec=True)
+    @mock.patch.object(redfish_utils, 'get_system', autospec=True)
+    def test_configuration_media_requires_known_free_slot(
+            self, mock_system, mock_vmedia_system):
+        for inserted in (True, None):
+            with self.subTest(second_slot_inserted=inserted):
+                with task_manager.acquire(self.context, self.node.uuid,
+                                          shared=True) as task:
+                    mock_vmedia_system.return_value = True
+                    task.driver.boot._get_acceptable_media_id = mock.Mock(
+                        return_value=None)
+                    boot = mock.MagicMock(
+                        identity='boot', inserted=True,
+                        media_types=[sushy.VIRTUAL_MEDIA_CD,
+                                     sushy.VIRTUAL_MEDIA_USBSTICK])
+                    other = mock.MagicMock(
+                        identity='other', inserted=inserted,
+                        media_types=[sushy.VIRTUAL_MEDIA_USBSTICK])
+                    resource = mock_system.return_value
+                    resource.virtual_media.get_members.return_value = [
+                        boot, other]
+
+                    self.assertRaises(
+                        exception.InvalidParameterValue,
+                        redfish_boot._insert_vmedia, task, [], 'config-url',
+                        sushy.VIRTUAL_MEDIA_USBSTICK,
+                        preserve_existing=True)
+
+                    for device in (boot, other):
+                        device.eject_media.assert_not_called()
+                        device.insert_media.assert_not_called()
+
+    def test_configuration_media_respects_vendor_slot_restriction(self):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            task.driver.boot._get_acceptable_media_id = mock.Mock(
+                return_value='boot')
+            boot = mock.MagicMock(
+                identity='boot', inserted=True,
+                media_types=[sushy.VIRTUAL_MEDIA_USBSTICK])
+            free = mock.MagicMock(
+                identity='free', inserted=False,
+                media_types=[sushy.VIRTUAL_MEDIA_USBSTICK])
+            resource = mock.MagicMock()
+            resource.virtual_media.get_members.return_value = [boot, free]
+
+            self.assertFalse(redfish_boot._insert_vmedia_in_resource(
+                task, resource, 'config-url', sushy.VIRTUAL_MEDIA_USBSTICK,
+                [], preserve_existing=True))
+
+            for device in (boot, free):
+                device.eject_media.assert_not_called()
+                device.insert_media.assert_not_called()
 
     def test__insert_vmedia_ejects_all_slots(self):
         with task_manager.acquire(self.context, self.node.uuid,
@@ -2986,7 +3077,9 @@ class RedfishHTTPBootTestCase(db_base.DbTestCase):
 
             mock_prepare_boot_iso.return_value = 'image-url'
 
-            task.driver.boot.prepare_instance(task)
+            with mock.patch.object(
+                    redfish_boot, '_wait_for_deployment_media', autospec=True):
+                task.driver.boot.prepare_instance(task)
 
             mock_clean_up_instance.assert_called_once_with(mock.ANY, task)
 
@@ -3110,7 +3203,9 @@ class RedfishHTTPBootTestCase(db_base.DbTestCase):
 
             mock_prepare_boot_iso.return_value = 'image-url'
 
-            task.driver.boot.prepare_instance(task)
+            with mock.patch.object(
+                    redfish_boot, '_wait_for_deployment_media', autospec=True):
+                task.driver.boot.prepare_instance(task)
 
             mock_prepare_boot_iso.assert_called_once_with(task, d_info)
 
@@ -3726,3 +3821,120 @@ class RedfishVirtualMediaBootViaSystemTestCase(db_base.DbTestCase):
             mock_vmedia_1.insert_media.assert_called_once_with(
                 'http://example.com/boot.iso', inserted=True,
                 write_protected=True)
+
+
+class RamdiskMediaOwnershipTestCase(db_base.DbTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.config(enabled_hardware_types=['redfish'],
+                    enabled_power_interfaces=['redfish'],
+                    enabled_boot_interfaces=['redfish-virtual-media'],
+                    enabled_management_interfaces=['redfish'],
+                    enabled_inspect_interfaces=['redfish'],
+                    enabled_bios_interfaces=['redfish'])
+        self.node = obj_utils.create_test_node(
+            self.context, driver='redfish', driver_info=INFO_DICT)
+
+    @mock.patch.object(redfish_boot, '_deployment_media', autospec=True)
+    def test_teardown_preserves_unrelated_media(self, mock_devices):
+        boot = mock.Mock(inserted=True, image='boot-url')
+        config = mock.Mock(inserted=True, image='config-url')
+        other = mock.Mock(inserted=True, image='unrelated-url')
+        for device in (boot, config):
+            device.eject_media.side_effect = lambda d=device: setattr(
+                d, 'inserted', False)
+        mock_devices.return_value = [boot, config, other]
+        redfish_boot._eject_deployment_media(
+            mock.sentinel.task, [], {'boot-url', 'config-url'})
+        boot.eject_media.assert_called_once_with()
+        config.eject_media.assert_called_once_with()
+        other.eject_media.assert_not_called()
+
+    @mock.patch.object(redfish_boot, '_deployment_media', autospec=True)
+    def test_teardown_requires_observable_media_identity(self, mock_devices):
+        for inserted in (True, None):
+            device = mock.Mock(inserted=inserted, image=None)
+            mock_devices.return_value = [device]
+            with task_manager.acquire(self.context, self.node.uuid) as task:
+                self.assertRaises(
+                    exception.InstanceDeployFailure,
+                    redfish_boot._eject_deployment_media,
+                    task, [], {'boot-url', 'config-url'})
+            device.eject_media.assert_not_called()
+
+    @mock.patch.object(redfish_boot, '_deployment_media', autospec=True)
+    def test_first_deployment_rejects_unowned_media(self, mock_devices):
+        for inserted in (True, None):
+            device = mock.Mock(inserted=inserted, image='unknown-url')
+            mock_devices.return_value = [device]
+            with task_manager.acquire(self.context, self.node.uuid) as task:
+                self.assertRaises(
+                    exception.InstanceDeployFailure,
+                    redfish_boot._eject_deployment_media, task, [], set())
+            device.eject_media.assert_not_called()
+
+    @mock.patch.object(redfish_boot, '_deployment_media', autospec=True)
+    def test_attachment_requires_both_actual_images(self, mock_devices):
+        mock_devices.return_value = [
+            mock.Mock(inserted=True, image='boot-url'),
+            mock.Mock(inserted=False, image='config-url')]
+        self.assertRaises(
+            exception.TemporaryFailure,
+            redfish_boot._wait_for_deployment_media.__wrapped__,
+            mock.sentinel.task, [], {'boot-url', 'config-url'})
+        mock_devices.return_value[1].inserted = True
+        redfish_boot._wait_for_deployment_media.__wrapped__(
+            mock.sentinel.task, [], {'boot-url', 'config-url'})
+
+    @mock.patch.object(redfish_boot, '_insert_vmedia', autospec=True)
+    @mock.patch.object(image_utils, 'prepare_configdrive_image', autospec=True)
+    def test_interrupted_insertion_retains_configuration_identity(
+            self, mock_prepare, mock_insert):
+        mock_prepare.return_value = 'published-config.iso'
+        mock_insert.side_effect = exception.InvalidParameterValue(
+            'BMC rejected insertion')
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            task.node.set_instance_info(
+                'configdrive', 'https://example.com/attempt/config.iso')
+            task.node.save()
+            self.assertRaisesRegex(
+                exception.InstanceDeployFailure, 'BMC rejected insertion',
+                task.driver.boot._attach_configdrive, task, [])
+            task.node.refresh()
+            media = task.node.driver_internal_info['ramdisk_virtual_media']
+            self.assertEqual('published-config.iso', media['configdrive'])
+            self.assertEqual('https://example.com/attempt/config.iso',
+                             media['configdrive_source'])
+            self.assertEqual(
+                hashlib.sha256(
+                    b'https://example.com/attempt/config.iso').hexdigest(),
+                media['configuration_source_sha256'])
+            self.assertEqual(
+                hashlib.sha256(b'published-config.iso').hexdigest(),
+                media['configuration_media_sha256'])
+
+    @mock.patch.object(redfish_boot, '_wait_for_deployment_media',
+                       autospec=True)
+    @mock.patch.object(redfish_boot.RedfishVirtualMediaBoot,
+                       '_eject_all', autospec=True)
+    def test_active_adoption_does_not_replace_live_media(
+            self, mock_eject, mock_wait):
+        with task_manager.acquire(self.context, self.node.uuid) as task, \
+                mock.patch.object(redfish_utils, 'get_system', autospec=True):
+            task.node.provision_state = states.ACTIVE
+            task.node.deploy_interface = 'ramdisk'
+            task.node.instance_info = {
+                'capabilities': {'boot_option': 'ramdisk'},
+                'configdrive': 'https://example.com/config.iso'}
+            task.node.set_driver_internal_info('ramdisk_virtual_media', {
+                'boot': 'boot-url', 'configdrive': 'config-url',
+                'configdrive_source': 'https://example.com/config.iso'})
+            task.driver.boot.prepare_instance(task)
+            mock_eject.assert_not_called()
+            mock_wait.assert_called_once_with(
+                task, mock.ANY, {'boot-url', 'config-url'})
+            task.node.instance_info['configdrive'] = 'https://other/config.iso'
+            self.assertRaises(exception.InstanceDeployFailure,
+                              task.driver.boot.prepare_instance, task)
+            mock_eject.assert_not_called()

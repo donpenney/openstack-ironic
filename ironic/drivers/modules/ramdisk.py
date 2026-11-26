@@ -95,25 +95,28 @@ class RamdiskDeploy(agent_base.AgentBaseMixin, agent_base.HeartbeatMixin,
                 message=_('Invalid configuration: The boot interface '
                           'must have the `ramdisk_boot` capability. '
                           'You are using an incompatible boot interface.'))
+        self._validate_configdrive(task)
         task.driver.boot.validate(task)
 
         # Validate node capabilities
         deploy_utils.validate_capabilities(task.node)
 
+    @staticmethod
+    def _validate_configdrive(task):
+        if (task.node.instance_info.get('configdrive')
+                and 'ramdisk_boot_configdrive' not in
+                task.driver.boot.capabilities):
+            raise exception.InvalidParameterValue(
+                _('The requested configuration drive cannot be delivered '
+                  'by this ramdisk boot interface.'))
+
     @METRICS.timer('RamdiskDeploy.deploy')
     @base.deploy_step(priority=100)
     @task_manager.require_exclusive_lock
     def deploy(self, task):
-        if ('configdrive' in task.node.instance_info
-                and 'ramdisk_boot_configdrive' not in
-                task.driver.boot.capabilities):
-            # TODO(dtantsur): make it an actual error?
-            LOG.warning('A configuration drive is present in the ramdisk '
-                        'deployment request of node %(node)s with boot '
-                        'interface %(drv)s. The configuration drive will be '
-                        'ignored for this deployment.',
-                        {'node': task.node,
-                         'drv': task.node.get_interface('boot')})
+        # Validate again here: configdrive can arrive with the deploy request,
+        # after the earlier node validation. Never silently boot without it.
+        self._validate_configdrive(task)
         manager_utils.node_power_action(task, states.POWER_OFF)
         # Tenant networks must enable connectivity to the boot
         # location, as reboot() can otherwise be very problematic.

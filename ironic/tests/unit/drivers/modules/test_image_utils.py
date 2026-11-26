@@ -416,19 +416,61 @@ class RedfishImageUtilsTestCase(db_base.DbTestCase):
             self.assertEqual(content, image_href)
             image_file.write(b'content')
 
-        def _prepare(task, content, prefix):
+        def _prepare(task, content, prefix, suffix):
+            self.assertEqual('', suffix)
             with open(content, 'rb') as fp:
                 self.assertEqual(b'content', fp.read())
             return expected_url
 
         mock_fetch.side_effect = _fetch
         mock_prepare.side_effect = _prepare
-        mock_execute.return_value = 'application/octet-stream'
+        mock_execute.return_value = 'application/octet-stream', ''
 
         with task_manager.acquire(self.context, self.node.uuid,
                                   shared=True) as task:
             result = image_utils.prepare_configdrive_image(task, content)
             self.assertEqual(expected_url, result)
+
+    @mock.patch.object(utils, 'file_mime_type', autospec=True)
+    @mock.patch.object(images, 'fetch_into', autospec=True)
+    @mock.patch.object(image_utils.ImageHandler, 'publish_image',
+                       autospec=True)
+    def test_prepare_configdrive_image_iso_url(self, mock_publish, mock_fetch,
+                                               mock_mime_type):
+        # Detect the payload format even if its source URL is extensionless.
+        content = 'https://source/configuration'
+        expected_url = 'https://ironic/configdrive.iso'
+
+        def _fetch(context, image_href, image_file):
+            self.assertEqual(content, image_href)
+            image_file.write(b'configuration ISO bytes')
+
+        def _publish(handler, image_file, object_name):
+            with open(image_file, 'rb') as fp:
+                self.assertEqual(b'configuration ISO bytes', fp.read())
+            return expected_url
+
+        mock_fetch.side_effect = _fetch
+        mock_publish.side_effect = _publish
+        mock_mime_type.return_value = 'application/x-iso9660-image'
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            result = image_utils.prepare_configdrive_image(task, content)
+            self.assertEqual(expected_url, result)
+            mock_publish.assert_called_once_with(
+                mock.ANY, mock.ANY, 'configdrive-%s.iso' % task.node.uuid)
+
+    @mock.patch.object(image_utils.ImageHandler, 'unpublish_image',
+                       autospec=True)
+    def test_cleanup_disk_image_legacy_and_iso(self, mock_unpublish):
+        with task_manager.acquire(self.context, self.node.uuid,
+                                  shared=True) as task:
+            image_utils.cleanup_disk_image(task, prefix='configdrive')
+            name = 'configdrive-%s' % task.node.uuid
+            self.assertEqual([
+                mock.call(mock.ANY, name),
+                mock.call(mock.ANY, name + '.iso')],
+                mock_unpublish.call_args_list)
 
     @mock.patch.object(image_utils.ImageHandler, 'unpublish_image',
                        autospec=True)

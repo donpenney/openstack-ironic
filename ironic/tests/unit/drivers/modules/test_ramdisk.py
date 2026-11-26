@@ -142,8 +142,21 @@ class RamdiskDeployTestCase(db_base.DbTestCase):
         self.node.set_instance_info('configdrive', 'meow')
         self.node.save()
         with task_manager.acquire(self.context, self.node.uuid) as task:
-            self.assertIsNone(task.driver.deploy.deploy(task))
-            self.assertTrue(mock_warning.called)
+            self.assertRaises(exception.InvalidParameterValue,
+                              task.driver.deploy.deploy, task)
+            mock_image_info.assert_not_called()
+            mock_warning.assert_not_called()
+
+    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
+    @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
+    def test_boot_preparation_failure_prevents_power_on(
+            self, mock_prepare_instance, mock_power):
+        mock_prepare_instance.side_effect = exception.InstanceDeployFailure(
+            'Configuration media cannot be attached')
+        with task_manager.acquire(self.context, self.node.uuid) as task:
+            self.assertRaises(exception.InstanceDeployFailure,
+                              task.driver.deploy.deploy, task)
+            mock_power.assert_called_once_with(task, states.POWER_OFF)
 
     @mock.patch.object(pxe.PXEBoot, 'prepare_instance', autospec=True)
     def test_prepare(self, mock_prepare_instance):
@@ -250,9 +263,12 @@ class RamdiskDeployTestCase(db_base.DbTestCase):
         self.node.instance_info = i_info
         self.node.save()
         mock_warning.reset_mock()
+        mock_image_info.reset_mock()
         with task_manager.acquire(self.context, self.node.uuid) as task:
-            self.assertIsNone(task.driver.deploy.deploy(task))
-            self.assertTrue(mock_warning.called)
+            self.assertRaises(exception.InvalidParameterValue,
+                              task.driver.deploy.deploy, task)
+            mock_image_info.assert_not_called()
+            mock_warning.assert_not_called()
 
     @mock.patch.object(agent_base, 'get_steps', autospec=True)
     def test_get_clean_steps(self, mock_get_steps):

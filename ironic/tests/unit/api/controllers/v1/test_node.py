@@ -995,6 +995,26 @@ class TestListNodes(test_api_base.BaseApiTest):
         self.assertEqual('******', dii['agent_secret_token'])
         self.assertEqual('******', dii['agent_secret_token_pregenerated'])
 
+    def test_get_ramdisk_media_fingerprints_preserve_redaction(self):
+        node = obj_utils.create_test_node(
+            self.context,
+            driver_internal_info={
+                'ramdisk_virtual_media': {
+                    'configdrive': 'https://images.example.com/private.iso',
+                    'configdrive_source': 'https://user:password@example.com/',
+                    'configuration_source_sha256': 'a' * 64,
+                    'configuration_media_sha256': 'b' * 64,
+                }
+            })
+        response = self.get_json(
+            '/nodes/%s' % node.uuid,
+            headers={api_base.Version.string: '1.93'})
+        media = response['driver_internal_info']['ramdisk_virtual_media']
+        self.assertEqual('******', media['configdrive'])
+        self.assertEqual('******', media['configdrive_source'])
+        self.assertEqual('a' * 64, media['configuration_source_sha256'])
+        self.assertEqual('b' * 64, media['configuration_media_sha256'])
+
     def test_get_disable_power_off_fields(self):
         node = obj_utils.create_test_node(self.context,
                                           disable_power_off=True)
